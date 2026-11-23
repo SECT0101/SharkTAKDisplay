@@ -2,7 +2,7 @@
 # Title: SharkTAKDisplay
 # Description: Wired network survey to TAK - fingerprint, host/service discovery, baseline (rogue device) diff and packet capture, sent as a CoT marker with the summary in remarks plus a data package with the full results
 # Author: SECT0101
-# Version: 1.0.0
+# Version: 1.0.1
 # Category: Recon
 # Target: Any wired Ethernet network you are authorized to assess
 #
@@ -54,7 +54,7 @@
 #   /root/sharktakdisplay/baselines/  known-good scans, one per network
 #   /root/sharktakdisplay/sites.txt   saved sites: name|lat|lon
 #   /root/loot/sharktakdisplay/       every survey (summary, hosts, nmap, pcap, package)
-#   /tmp/sharktakdisplay/*.log        logs, kept until reboot
+#   /root/sharktakdisplay/logs/       logs, history and the last running step (survive a shutdown)
 #
 # Use only on networks you own or are authorized to assess.
 
@@ -65,7 +65,7 @@
 # Bash 5.2+: "&" in ${var//x/y} would mean "the match" and break the XML escaping below
 shopt -u patsub_replacement 2>/dev/null
 
-PAYLOAD_VERSION="1.0.0"
+PAYLOAD_VERSION="1.0.1"
 PRODUCT_NAME="SharkTAKDisplay"
 PROFILE="default.cfg"
 
@@ -102,7 +102,14 @@ D_HOST_RING_M="25"
 D_MAX_HOST_MARKERS="40"
 D_STALE_HOURS="24"                   # how long the survey marker stays on the map
 D_LISTEN="8"                         # seconds to listen for TAK contacts after connecting
-D_CHAT_ALERT="1"                     # 1 = GeoChat line to All Chat Rooms when new devices are found
+D_CHAT_ALERT="1"
+D_SCAN_BATCH="4"                     # hosts per service-scan batch; each batch is saved when it finishes
+D_BATCH_LIMIT="240"                  # seconds before a stuck batch is stopped and the scan moves on
+D_MIN_FREE_KB="30000"                # version detection (-sV) needs ~20 MB; only run it with this much free
+D_WATCHDOG_KB="3000"                 # stop nmap if free memory falls below this (keeps the jack from freezing)
+D_SCAN_RATE="50"                     # nmap --max-rate (packets per second) - the jack's Ethernet locks up under floods
+D_SCAN_TYPE="connect"                # connect (-sT, gentle) | syn (-sS, raw packets, faster)
+D_BIG_SCAN_HOSTS="24"                # on battery, ask before a service scan of more live hosts than this                     # 1 = GeoChat line to All Chat Rooms when new devices are found
 
 # Paths
 BASE_DIR="/root/sharktakdisplay"
@@ -114,6 +121,7 @@ SITES_FILE="$BASE_DIR/sites.txt"
 CONTACTS_FILE="$BASE_DIR/contacts.txt"     # callsign|uid|lat|lon|ce|epoch
 LOOT_BASE="/root/loot/sharktakdisplay"
 RUN="/tmp/sharktakdisplay"
+LOGS="$BASE_DIR/logs"                      # kept on flash: they survive a shutdown or a flat battery
 CLIENT_PEM="client.pem"
 CA_PEM="ca.pem"
 BACK="← Back"
@@ -210,8 +218,16 @@ load_config() {
     C_MAX_HM=$(cfg MAX_HOST_MARKERS "$D_MAX_HOST_MARKERS")
     C_STALE_H=$(cfg STALE_HOURS "$D_STALE_HOURS"); C_LISTEN=$(cfg LISTEN "$D_LISTEN")
     C_CHAT_ALERT=$(cfg CHAT_ALERT "$D_CHAT_ALERT")
+    C_BATCH=$(num "$(cfg SCAN_BATCH "$D_SCAN_BATCH")"); [ "${C_BATCH:-0}" -gt 0 ] || C_BATCH=4
+    C_BATCH_LIMIT=$(num "$(cfg BATCH_LIMIT "$D_BATCH_LIMIT")"); C_BATCH_LIMIT=${C_BATCH_LIMIT:-240}
+    C_MIN_FREE=$(num "$(cfg MIN_FREE_KB "$D_MIN_FREE_KB")"); C_MIN_FREE=${C_MIN_FREE:-30000}
+    C_WATCHDOG=$(num "$(cfg WATCHDOG_KB "$D_WATCHDOG_KB")"); C_WATCHDOG=${C_WATCHDOG:-3000}
+    C_RATE=$(num "$(cfg SCAN_RATE "$D_SCAN_RATE")"); C_RATE=${C_RATE:-50}
+    C_STYPE=$(cfg SCAN_TYPE "$D_SCAN_TYPE")
+    C_BIG=$(num "$(cfg BIG_SCAN_HOSTS "$D_BIG_SCAN_HOSTS")"); C_BIG=${C_BIG:-24}
 }
 
+num() { [[ $1 =~ ^[0-9]+$ ]] && printf '%d' "$((10#$1))"; }   # "030" -> 30 (never octal)
 cancelled() { [ -z "$1" ] || [ "$1" = "$BACK" ] || [ "$1" = "Cancelled" ]; }
 info() { ALERT "$1" -1 false true; }           # message screen, waits for a button
 note() { ALERT "$1" 2 false; }                 # short message, 2 s
@@ -254,21 +270,43 @@ need_pkg() {
     [ "$r" = "Install" ] || return 1
     ensure_net || return 1
     CREATE_SPINNER "Installing $2"
-    opkg update > "$RUN/opkg.log" 2>&1     # always ends in an error for the firmware's missing hak5 feed - ignored
-    opkg install "$2" >> "$RUN/opkg.log" 2>&1
+    opkg update > "$LOGS/opkg.log" 2>&1     # always ends in an error for the firmware's missing hak5 feed - ignored
+    opkg install "$2" >> "$LOGS/opkg.log" 2>&1
     STOP_SPINNER
     command -v "$1" >/dev/null 2>&1 && { LOG "$2 installed"; return 0; }
-    info "Install of $2 failed.\nSee $RUN/opkg.log"
+    info "Install of $2 failed.\nSee $LOGS/opkg.log"
     return 1
 }
 
 need_pkg_quiet() {  # need_pkg_quiet package - installs without asking (used during setup steps the user started)
     ensure_net || return 1
     CREATE_SPINNER "Installing $1"
-    opkg update > "$RUN/opkg.log" 2>&1
-    opkg install "$1" >> "$RUN/opkg.log" 2>&1; local rc=$?
+    opkg update > "$LOGS/opkg.log" 2>&1
+    opkg install "$1" >> "$LOGS/opkg.log" 2>&1; local rc=$?
     STOP_SPINNER
     return $rc
+}
+
+# Breadcrumb on flash: which step was running. If the jack loses power mid-scan, the next
+# start says where it stopped (and the history log keeps it).
+step() {
+    mkdir -p "$LOGS" 2>/dev/null
+    printf '%s|%s\n' "$(date '+%F %T')" "$1" > "$LOGS/step"
+    printf '%s %s\n' "$(date '+%F %T')" "$1" >> "$LOGS/history.log"
+    sync
+}
+step_check() {  # at start: report an unfinished previous run
+    [ -s "$LOGS/step" ] || return 0
+    local last; last=$(cut -d'|' -f2- "$LOGS/step")
+    case "$last" in exit|idle|menu) return 0 ;; esac
+    LAST_STOP="$last"
+    printf '%s %s\n' "$(date '+%F %T')" "start after unclean stop during: $last" >> "$LOGS/history.log"
+}
+trim_logs() {  # keep each log under ~200 KB
+    local f
+    for f in "$LOGS"/*.log; do
+        [ -f "$f" ] && [ "$(wc -c < "$f")" -gt 204800 ] && { tail -c 102400 "$f" > "$f.t" && mv "$f.t" "$f"; }
+    done
 }
 
 device_uid() {
@@ -392,6 +430,43 @@ dhcp_servers() {
     sed -n 's/.*obtained from \([0-9.]*\).*/\1/p' "$f" | sort -u | tr '\n' ' '
 }
 
+# Free memory in KB (MemAvailable, or MemFree + Cached on older kernels)
+mem_free_kb() {
+    awk '/^MemAvailable:/ { a = $2 } /^MemFree:/ { f = $2 } /^Cached:/ { c = $2 }
+         END { print (a != "" ? a : f + c) + 0 }' /proc/meminfo 2>/dev/null
+}
+# Vitals on flash every 3 s (watchdog every 1 s) while scanning: if the jack locks up, the last lines show
+# whether memory ran out (free KB, nmap RSS) or it was something else (memory fine).
+vitals_start() {
+    vitals_stop
+    (
+        local n=0 f
+        while :; do
+            f=$(mem_free_kb)
+            # watchdog: the jack has no swap, so running out of memory freezes it - stop nmap first
+            if [ "${f:-0}" -lt "${C_WATCHDOG:-3000}" ] && pidof nmap >/dev/null 2>&1; then
+                echo "$(date '+%F %T') watchdog stopped nmap: ${f} KB free" >> "$LOGS/history.log"
+                echo "$(date '+%T') WATCHDOG killed nmap at free=${f}KB" >> "$LOGS/vitals.log"
+                sync
+                killall -9 nmap 2>/dev/null
+            fi
+            n=$((n + 1)); [ $((n % 3)) -eq 1 ] || { sleep 1; continue; }   # check every 1 s, log every 3 s
+            printf '%s free=%sKB load=%s nmap=%sKB\n' "$(date '+%T')" "$f" \
+                "$(cut -d' ' -f1 /proc/loadavg)" \
+                "$(for p in $(pidof nmap 2>/dev/null); do awk '/^VmRSS:/ {print $2}' "/proc/$p/status" 2>/dev/null; done | head -1)" \
+                >> "$LOGS/vitals.log"
+            sync
+            sleep 1
+        done
+    ) &
+    VITALS_PID=$!
+}
+vitals_stop() { [ -n "$VITALS_PID" ] && kill "$VITALS_PID" 2>/dev/null; VITALS_PID=""; }
+
+# nmap at the lowest CPU priority, so the screen, buttons and SSH stay responsive
+NMAP_LOW=(nmap); command -v nice >/dev/null 2>&1 && NMAP_LOW=(nice -n 19 nmap)
+nmap_low() { "${NMAP_LOW[@]}" "$@"; }
+
 LLDPD_STARTED=0
 lldp_listen() {  # fills $S_DIR/lldp.txt (key=value)
     local i=0
@@ -447,6 +522,7 @@ scan_fingerprint() {
     fi
 
     # DHCP servers: more than one answering is a rogue DHCP server
+    step "fingerprint: DHCP check"
     CREATE_SPINNER "DHCP servers"
     servers=$(dhcp_servers)
     STOP_SPINNER
@@ -520,6 +596,7 @@ scan_fingerprint() {
     remark "Internet ${F_INET}${F_PUBIP:+, public $F_PUBIP}${F_ISP:+ ($F_ISP)}"
     [ "$F_DHCP" -gt 1 ] 2>/dev/null && remark "ROGUE DHCP? $F_DHCP servers: $servers"
     S_PARTS+=" fingerprint"
+    step idle
     LOG "Fingerprint done"
     return 0
 }
@@ -570,21 +647,63 @@ scan_hosts() {
     net_basics
     sum "== Hosts on $target"
     CREATE_SPINNER "Sweep $target"
-    nmap -sn -n "$target" --exclude "$N_IP" -oX "$S_DIR/sweep.xml" > /dev/null 2>&1
+    step "host sweep $target"
+    echo "--- $(date '+%F %T') host sweep $target" >> "$LOGS/vitals.log"
+    vitals_start
+    nmap_low -sn -n -T3 --max-rate "$C_RATE" "$target" --exclude "$N_IP" -oX "$S_DIR/sweep.xml" > /dev/null 2>&1
+    vitals_stop
     STOP_SPINNER
     parse_nmap_xml "$S_DIR/sweep.xml" > "$S_DIR/hosts.tsv"
     cut -f1 "$S_DIR/hosts.tsv" > "$RUN/live.txt"
     live=$(wc -l < "$RUN/live.txt"); live=${live// /}
     sum "Live hosts: $live"
     if [ "$live" -gt 0 ]; then
-        svc_args=(-sS -n --open --top-ports "$C_TOP" -T4 --host-timeout "$C_HTO" --max-retries 1)
-        [ "$C_SV" = 1 ] && svc_args+=(-sV --version-light)
-        [ "$C_NSE" = 1 ] && nmap_nse && svc_args+=(--script "banner,http-title,ssl-cert,smb-os-discovery,smb2-security-mode,rdp-ntlm-info")
-        CREATE_SPINNER "Ports on $live hosts"
-        nmap "${svc_args[@]}" -iL "$RUN/live.txt" -oX "$S_DIR/services.xml" -oN "$S_DIR/services.txt" > /dev/null 2>&1
-        STOP_SPINNER
+        local top_ports=$C_TOP sv=$C_SV nse=$C_NSE bat
+        # A long service scan at full CPU can flatten or brown out the small battery
+        bat=$(BATTERY 2>/dev/null)
+        if [ "$bat" != "Charging" ] && [ "$live" -gt "$C_BIG" ]; then
+            local r; r=$(OPTION_DIALOG "$live hosts on battery may shut the jack off. Plug in USB-C, or scan lighter?" "Lighter" "Continue")
+            if [ "$r" = "Lighter" ]; then top_ports=20; sv=0; nse=0; sum "Lighter scan (battery): top 20 ports, no versions"; fi
+        fi
+        # Gentle on a single 580 MHz core, ~64 MB RAM and an Ethernet chip that locks up under floods:
+        # connect scan, capped packet rate and parallelism, -T3
+        local st=-sT; [ "$C_STYPE" = syn ] && st=-sS
+        local gentle=("$st" -n --open --top-ports "$top_ports" -T3 --max-rate "$C_RATE" --max-parallelism 8 --host-timeout "$C_HTO" --max-retries 1)
+        svc_args=("${gentle[@]}")
+        [ "$sv" = 1 ] && svc_args+=(-sV --version-light)
+        [ "$nse" = 1 ] && nmap_nse && svc_args+=(--script "banner,http-title,ssl-cert,smb-os-discovery,smb2-security-mode,rdp-ntlm-info")
+        # in batches: each one is saved as it finishes, so a shutdown keeps what was done
+        rm -f "$RUN"/batch.* "$S_DIR"/services-*.xml; : > "$S_DIR/services.txt"; : > "$RUN/svc.tsv"
+        awk -v n="$C_BATCH" -v p="$RUN/batch." '{ f = sprintf("%s%03d", p, int((NR - 1) / n)); print > f }' "$RUN/live.txt"
+        local b nb=0 i=0
+        for b in "$RUN"/batch.*; do nb=$((nb + 1)); done
+        CREATE_PROGRESS_BAR "Ports on $live hosts"
+        sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null    # free page cache before the big step
+        echo "--- $(date '+%F %T') service scan, $live hosts, $st, rate $C_RATE" >> "$LOGS/vitals.log"
+        vitals_start
+        for b in "$RUN"/batch.*; do
+            i=$((i + 1))
+            local args=("${svc_args[@]}") mf
+            mf=$(mem_free_kb)
+            if [ "${mf:-0}" -lt "$C_MIN_FREE" ]; then        # low memory: drop version detection / scripts for this batch
+                args=("${gentle[@]}")
+                [ "$i" = 1 ] && [ "$sv" = 1 ] && echo "$(date '+%F %T') ${mf} KB free: ports only, no -sV (needs ${C_MIN_FREE} KB)" >> "$LOGS/history.log"
+                LOG "Low memory (${mf} KB): ports only"
+            fi
+            step "service scan batch $i/$nb ($live hosts, $top_ports ports, ${mf} KB free)"
+            run_for "$C_BATCH_LIMIT" "${NMAP_LOW[@]}" "${args[@]}" -iL "$b" -oX "$S_DIR/services-$(printf '%02d' "$i").xml" >> "$S_DIR/services.txt" 2>&1
+            local brc=$?
+            if [ "$brc" -eq 124 ] || [ "$brc" -eq 143 ] || [ "$brc" -eq 137 ]; then   # timeout (GNU / BusyBox / kill)
+                LOG "Batch $i stopped after ${C_BATCH_LIMIT}s"
+                echo "$(date '+%F %T') batch $i stopped after ${C_BATCH_LIMIT}s" >> "$LOGS/history.log"
+            fi
+            parse_nmap_xml "$S_DIR/services-$(printf '%02d' "$i").xml" >> "$RUN/svc.tsv"
+            sync
+            SET_PROGRESS $(( i * 100 / nb < 100 ? i * 100 / nb : 99 ))
+        done
+        vitals_stop
+        SET_PROGRESS 100
         # merge: keep MAC/vendor from the sweep, ports from the service scan
-        parse_nmap_xml "$S_DIR/services.xml" > "$RUN/svc.tsv"
         awk -F'\t' -v OFS='\t' 'NR==FNR { p[$1]=$5; if ($4!="") h[$1]=$4; next }
             { if ($1 in p) $5=p[$1]; if ($4=="" && ($1 in h)) $4=h[$1]; print }' "$RUN/svc.tsv" "$S_DIR/hosts.tsv" > "$RUN/merged.tsv"
         mv "$RUN/merged.tsv" "$S_DIR/hosts.tsv"
@@ -600,6 +719,7 @@ scan_hosts() {
     n=$(awk -F'\t' '$5!=""' "$S_DIR/hosts.tsv" | wc -l)
     remark "Hosts $live on $target, $((n)) with open ports${top:+: $top}"
     S_PARTS+=" hosts"
+    step idle
     LOG "Host scan done"
     return 0
 }
@@ -676,7 +796,8 @@ scan_pcap() {
     need_pkg tcpdump tcpdump "Packet capture" || return 1
     LED ATTACK
     local f="$S_DIR/capture.pcap" i pkts size
-    tcpdump -i eth0 -n -s 0 -c "$C_PCAP_N" -w "$f" > /dev/null 2> "$RUN/tcpdump.log" &
+    step "packet capture ${C_PCAP_S}s"
+    tcpdump -i eth0 -n -s 0 -c "$C_PCAP_N" -w "$f" > /dev/null 2> "$LOGS/tcpdump.log" &
     local pid=$!
     CREATE_PROGRESS_BAR "Capture ${C_PCAP_S}s"
     for ((i = 1; i <= C_PCAP_S; i++)); do
@@ -685,11 +806,12 @@ scan_pcap() {
     done
     kill -INT "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
     SET_PROGRESS 100
-    pkts=$(grep -o '[0-9]* packets captured' "$RUN/tcpdump.log" | awk '{print $1}')
+    pkts=$(grep -o '[0-9]* packets captured' "$LOGS/tcpdump.log" | awk '{print $1}')
     size=$(wc -c < "$f" 2>/dev/null); size=$(( ${size:-0} / 1024 ))
     sum "== Packet capture: ${pkts:-?} packets, ${size} KB in ${C_PCAP_S}s"
     remark "pcap ${C_PCAP_S}s ${pkts:-?} pkts ${size}KB"
     S_PARTS+=" pcap"
+    step idle
 }
 
 # ---------------------------------------------------------------------------
@@ -870,21 +992,41 @@ marti_dest() {  # marti_dest callsign uid
 # (zip and gzip share the same deflate format and CRC-32).
 le16() { printf '\\x%02x\\x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )); }
 le32() { printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 )); }
+bytes_at() {  # bytes_at file offset count -> decimal byte values (od, hexdump, or plain Bash)
+    if command -v od >/dev/null 2>&1; then
+        od -An -tu1 -j "$2" -N "$3" "$1"
+    elif command -v hexdump >/dev/null 2>&1; then
+        hexdump -s "$2" -n "$3" -e '1/1 "%u "' "$1"; echo
+    else
+        local c out="" i
+        for ((i = 0; i < $3; i++)); do
+            LC_ALL=C IFS= read -r -d '' -n 1 c || c=""
+            out+="$(LC_ALL=C printf '%d' "'$c") "
+        done < <(tail -c +$(($2 + 1)) "$1" | head -c "$3")
+        echo "$out"
+    fi
+}
 u32_at() {  # u32_at file offset - little-endian 32-bit value
-    od -An -tu1 -j "$2" -N4 "$1" | awk '{ printf "%d\n", $1 + $2 * 256 + $3 * 65536 + $4 * 16777216 }'
+    # Bash math (64-bit): BusyBox awk's %d tops out at 2147483647 and corrupted half the CRCs
+    local b0 b1 b2 b3
+    read -r b0 b1 b2 b3 <<< "$(bytes_at "$1" "$2" 4)"
+    echo $(( b0 + (b1 << 8) + (b2 << 16) + (b3 << 24) ))
 }
 mkzip_sh() {  # mkzip_sh out.zip dir path... (paths relative to dir; folders are walked)
     local out=$1 dir=$2; shift 2
     local tmp="$RUN/mkzip.$$" cd="$RUN/mkzip.cd.$$" f gz size gsz crc csize off=0 n=0 name flg dt dd
     : > "$tmp.out"; : > "$cd"
     # DOS date/time of "now"
-    dt=$(( ($(date +%H) << 11) | ($(date +%M) << 5) | ($(date +%S) / 2) ))
-    dd=$(( (($(date +%Y) - 1980) << 9) | ($(date +%m | sed 's/^0//') << 5) | $(date +%d | sed 's/^0//') ))
+    # 10#: "08" and "09" are not octal (Bash would abort the payload on them)
+    local Y M D h m sec
+    read -r Y M D h m sec <<< "$(date '+%Y %m %d %H %M %S')"
+    dt=$(( (10#$h << 11) | (10#$m << 5) | (10#$sec / 2) ))
+    dd=$(( ((10#$Y - 1980) << 9) | (10#$M << 5) | 10#$D ))
     while IFS= read -r name; do
         f="$dir/$name"
-        gzip -c < "$f" > "$tmp.gz" || return 1
-        flg=$(od -An -tu1 -j3 -N1 "$tmp.gz" | tr -d ' ')
-        [ "$flg" = 0 ] || return 1                       # plain 10-byte gzip header expected
+        gzip -c < "$f" > "$tmp.gz" || { echo "gzip failed: $name" >&2; return 1; }
+        flg=$(bytes_at "$tmp.gz" 3 1 | tr -d ' ')
+        [ "$flg" = 0 ] || { echo "unexpected gzip header ($flg): $name" >&2; return 1; }   # plain 10-byte header expected
         gsz=$(wc -c < "$tmp.gz"); gsz=${gsz// /}
         size=$(wc -c < "$f"); size=${size// /}
         crc=$(u32_at "$tmp.gz" $((gsz - 8)))
@@ -912,13 +1054,15 @@ mkzip_sh() {  # mkzip_sh out.zip dir path... (paths relative to dir; folders are
 # ---------------------------------------------------------------------------
 build_package() {  # build_package marker_uid -> sets PKG_ZIP PKG_NAME
     local muid=$1 pdir="$RUN/pkg-$S_TS" sub f
+    mkdir -p "$LOGS"
     PKG_NAME="SharkTAKDisplay-${S_TS}.zip"; PKG_ZIP="$S_DIR/$PKG_NAME"
     sub=$(new_id)
     rm -rf "${pdir:?}"; mkdir -p "$pdir/MANIFEST" "$pdir/$sub"
     cot_survey "$muid" | fill_cot "" | sed 's|^|<?xml version="1.0" encoding="UTF-8" standalone="yes"?>|' > "$pdir/$sub/survey.cot"
-    for f in summary.txt hosts.tsv diff.txt services.txt services.xml sweep.xml dhcp.txt lldp.txt capture.pcap; do
+    for f in summary.txt hosts.tsv diff.txt services.txt sweep.xml dhcp.txt lldp.txt capture.pcap; do
         [ -s "$S_DIR/$f" ] && cp "$S_DIR/$f" "$pdir/$sub/"
     done
+    for f in "$S_DIR"/services-*.xml; do [ -s "$f" ] && cp "$f" "$pdir/$sub/"; done
     {
         echo '<MissionPackageManifest version="2">'
         echo ' <Configuration>'
@@ -939,10 +1083,10 @@ build_package() {  # build_package marker_uid -> sets PKG_ZIP PKG_NAME
     if command -v zip >/dev/null 2>&1; then
         ( cd "$pdir" && zip -q -r "$PKG_ZIP" MANIFEST "$sub" ) || { rm -rf "${pdir:?}"; info "zip failed"; return 1; }
     else
-        mkzip_sh "$PKG_ZIP" "$pdir" MANIFEST "$sub" || { rm -rf "${pdir:?}"; info "Package build\nfailed"; return 1; }
+        mkzip_sh "$PKG_ZIP" "$pdir" MANIFEST "$sub" 2> "$LOGS/zipcheck.log" || { rm -rf "${pdir:?}"; info "Package build failed\nSee $LOGS/zipcheck.log\nResults are in loot"; return 1; }
     fi
-    if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$PKG_ZIP" > "$RUN/zipcheck.log" 2>&1; then
-        rm -f "${PKG_ZIP:?}"; rm -rf "${pdir:?}"; info "Package check failed\nSee $RUN/zipcheck.log\nResults are in loot"; return 1
+    if command -v unzip >/dev/null 2>&1 && ! unzip -tq "$PKG_ZIP" > "$LOGS/zipcheck.log" 2>&1; then
+        rm -f "${PKG_ZIP:?}"; rm -rf "${pdir:?}"; info "Package check failed\nSee $LOGS/zipcheck.log\nResults are in loot"; return 1
     fi
     rm -rf "${pdir:?}"
     LOG "Package $((($(wc -c < "$PKG_ZIP") + 1023) / 1024)) KB"
@@ -979,31 +1123,34 @@ tak_ready() {  # config + certs present
     return 0
 }
 
+RX_MAX=$((512 * 1024))   # most a TAK session may hold in RAM (/tmp)
+
 # tak_session events_file listen_seconds -> sends, then listens; writes $RUN/rx. 0 = connected
 tak_session() {
     local ev=$1 listen=${2:-$C_LISTEN} rc=0
+    mkdir -p "$LOGS"
     : > "$RUN/rx"; LAST_ERR=""
     [ "$C_PROTO" != udp ] && { tcp_probe "$C_HOST" "$C_PORT" || { LAST_ERR="$C_HOST:$C_PORT no answer"; return 1; }; }
     case "$C_PROTO" in
         tls)
             tls_args
             # the sleep is the listen window; end of input then closes the session (-brief, no -ign_eof)
-            { cat "$ev"; sleep "$listen"; } | run_for $((listen + 8)) openssl s_client "${TLS_ARGS[@]}" > "$RUN/rx" 2> "$RUN/ssl.log"
-            if ! grep -q 'CONNECTION ESTABLISHED' "$RUN/ssl.log" \
-               || grep -qiE 'verify error|alert (bad|unknown|handshake|certificate)' "$RUN/ssl.log"; then
-                LAST_ERR=$(grep -iE -m1 'error|alert|unable|fail|mismatch' "$RUN/ssl.log" | sed 's/^[0-9A-F]*:error:[0-9A-F]*://' | cut -c1-60)
+            { cat "$ev"; sleep "$listen"; } | run_for $((listen + 8)) openssl s_client "${TLS_ARGS[@]}" 2> "$LOGS/ssl.log" | head -c "$RX_MAX" > "$RUN/rx"
+            if ! grep -q 'CONNECTION ESTABLISHED' "$LOGS/ssl.log" \
+               || grep -qiE 'verify error|alert (bad|unknown|handshake|certificate)' "$LOGS/ssl.log"; then
+                LAST_ERR=$(grep -iE -m1 'error|alert|unable|fail|mismatch' "$LOGS/ssl.log" | sed 's/^[0-9A-F]*:error:[0-9A-F]*://' | cut -c1-60)
                 LAST_ERR=${LAST_ERR:-TLS handshake failed}
                 rc=1
             fi ;;
         tcp)
             if have_devtcp; then
                 exec 3<>"/dev/tcp/$C_HOST/$C_PORT" 2>/dev/null || { LAST_ERR="TCP connect failed"; return 1; }
-                cat <&3 > "$RUN/rx" & local rp=$!
+                { cat <&3 | head -c "$RX_MAX" > "$RUN/rx"; } & local rp=$!
                 cat "$ev" >&3 || rc=1
                 sleep "$listen"; kill "$rp" 2>/dev/null; exec 3>&-
             else
                 command -v nc >/dev/null 2>&1 || { LAST_ERR="No /dev/tcp or nc for TCP"; return 1; }
-                { cat "$ev"; sleep "$listen"; } | run_for $((listen + 5)) nc "$C_HOST" "$C_PORT" > "$RUN/rx" 2>/dev/null
+                { cat "$ev"; sleep "$listen"; } | run_for $((listen + 5)) nc "$C_HOST" "$C_PORT" 2>/dev/null | head -c "$RX_MAX" > "$RUN/rx"
             fi ;;
         udp)
             if have_devtcp; then
@@ -1016,7 +1163,11 @@ tak_session() {
             fi ;;
         *) LAST_ERR="Unknown protocol $C_PROTO"; return 1 ;;
     esac
+    # /tmp is RAM: log what the server pushed, keep only the contacts, free the rest
+    local rxkb=$(( $(wc -c < "$RUN/rx" 2>/dev/null || echo 0) / 1024 ))
+    echo "$(date '+%F %T') TAK rx ${rxkb} KB in ${listen}s, free $(mem_free_kb) KB" >> "$LOGS/history.log"
     [ -s "$RUN/rx" ] && parse_contacts "$RUN/rx"
+    rm -f "$RUN/rx"
     return $rc
 }
 
@@ -1084,13 +1235,13 @@ upload_package() {  # upload_package zip [name] -> PKG_URL PKG_HASH PKG_SIZE
     PKG_HASH=$(sha256sum "$1" | awk '{print $1}'); PKG_SIZE=$(wc -c < "$1"); PKG_SIZE=${PKG_SIZE// /}
     url=$(curl -sS --fail --max-time 180 "${CURL_TLS[@]}" \
           -F "assetfile=@$1;filename=$name;type=application/x-zip-compressed" \
-          "$API_BASE/Marti/sync/missionupload?hash=$PKG_HASH&filename=$name&creatorUid=$C_UID" 2> "$RUN/upload.log")
+          "$API_BASE/Marti/sync/missionupload?hash=$PKG_HASH&filename=$name&creatorUid=$C_UID" 2> "$LOGS/upload.log")
     [ $? -eq 0 ] && [ -n "$url" ] || { LAST_ERR="Upload failed ($API_BASE)"; return 1; }
     PKG_URL=$(tr -d '\r\n' <<< "$url")
     [[ $PKG_URL == http* ]] || PKG_URL="$API_BASE/Marti/api/sync/metadata/$PKG_HASH/tool"
     # list it in the server's Data Packages
     curl -sS --max-time 30 "${CURL_TLS[@]}" -X PUT -H "Content-Type: text/plain" --data "public" \
-        "$API_BASE/Marti/api/sync/metadata/$PKG_HASH/tool" >> "$RUN/upload.log" 2>&1
+        "$API_BASE/Marti/api/sync/metadata/$PKG_HASH/tool" >> "$LOGS/upload.log" 2>&1
     return 0
 }
 
@@ -1107,7 +1258,9 @@ queue_survey() {  # queue_survey mode [dest_cs dest_uid]
     if [ "$S_ALERT" = 1 ] && [ "$C_CHAT_ALERT" = 1 ] && [ "$mode" != contact ]; then
         cot_chat "SharkTAKDisplay $C_CALLSIGN: survey needs a look - ${S_REMARKS[*]: -1}" > "$q/chat.cot"
     fi
+    step "building data package"
     build_package "$muid" && cp "$PKG_ZIP" "$q/package.zip"
+    step idle
     printf 'MODE=%s\nDEST_CS=%s\nDEST_UID=%s\nNAME=%s\n' "$mode" "$2" "$3" "SharkTAKDisplay-${S_TS}.zip" > "$q/meta"
     LOG "Queued $S_TS ($mode${2:+ to $2})"
 }
@@ -1129,11 +1282,13 @@ send_item() {  # send_item dir -> 0 sent
         [ $urc -eq 0 ] || return 1
         [ "$MODE" != upload ] && { cot_fileshare "$NAME" "$PKG_URL" "$PKG_SIZE" "$PKG_HASH" | fill_cot "$dest" >> "$RUN/out.cot"; echo >> "$RUN/out.cot"; }
     fi
+    step "sending to TAK"
     CREATE_SPINNER "Sending to TAK"
     tak_session "$RUN/out.cot" 3; local rc=$?
     STOP_SPINNER
-    [ $rc -eq 0 ] || return 1
+    [ $rc -eq 0 ] || { step idle; return 1; }
     mkdir -p "$SENT_DIR"; mv "$q" "$SENT_DIR/" 2>/dev/null
+    step idle
     return 0
 }
 
@@ -1351,9 +1506,9 @@ set_proto() {
 }
 set_port() {
     local r; r=$(SINGLE_NUMBER_PICKER "CoT port" "$C_PORT"); cancelled "$r" && return
-    [[ $r =~ ^[0-9]+$ ]] && { cfg_set TAK_PORT "$r"; C_PORT=$r; }
+    r=$(num "$r") && { cfg_set TAK_PORT "$r"; C_PORT=$r; }
     r=$(SINGLE_NUMBER_PICKER "API port (packages)" "$C_API_PORT"); cancelled "$r" && return
-    [[ $r =~ ^[0-9]+$ ]] && { cfg_set API_PORT "$r"; C_API_PORT=$r; }
+    r=$(num "$r") && { cfg_set API_PORT "$r"; C_API_PORT=$r; }
 }
 set_callsign() {
     local r; r=$(TEXT_PICKER "Callsign" "$C_CALLSIGN" "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"); cancelled "$r" && return
@@ -1375,7 +1530,7 @@ set_scope() {
 }
 set_pcap_seconds() {
     local r; r=$(SINGLE_NUMBER_PICKER "Capture seconds" "$C_PCAP_S" "10"); cancelled "$r" && return
-    [[ $r =~ ^[0-9]+$ ]] && [ "$r" -gt 0 ] && { cfg_set PCAP_SECONDS "$r"; C_PCAP_S=$r; }
+    r=$(num "$r") && [ "$r" -gt 0 ] && { cfg_set PCAP_SECONDS "$r"; C_PCAP_S=$r; }
 }
 set_netmode_opt() {
     local r; r=$(LIST_PICKER "Survey NETMODE" "DHCP_CLIENT STATIC" "$C_NETMODE"); cancelled "$r" && return
@@ -1405,7 +1560,7 @@ test_link() {
     tak_session_test; local rc=$?
     STOP_SPINNER
     local n=0; [ -s "$CONTACTS_FILE" ] && n=$(wc -l < "$CONTACTS_FILE")
-    if [ $rc -eq 0 ]; then LED FINISH; info "TAK OK\n$C_HOST:$C_PORT\nContacts: ${n// /}"; else LED FAIL; info "TAK failed\n${LAST_ERR:-see $RUN/ssl.log}"; fi
+    if [ $rc -eq 0 ]; then LED FINISH; info "TAK OK\n$C_HOST:$C_PORT\nContacts: ${n// /}"; else LED FAIL; info "TAK failed\n${LAST_ERR:-see $LOGS/ssl.log}"; fi
 }
 tak_session_test() { cot_presence | fill_cot "" > "$RUN/presence.cot"; echo >> "$RUN/presence.cot"; tak_session "$RUN/presence.cot" "$C_LISTEN"; }
 show_ssh() {
@@ -1426,15 +1581,15 @@ show_queue() {
 # ---------------------------------------------------------------------------
 convert_p12() {  # convert_p12 in.p12 out.pem password [nokeys]
     local extra=(-nodes); [ "$4" = nokeys ] && extra=(-nokeys)
-    openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2> "$RUN/p12.log" && return 0
-    openssl pkcs12 -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$RUN/p12.log" && return 0
+    openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2> "$LOGS/p12.log" && return 0
+    openssl pkcs12 -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$LOGS/p12.log" && return 0
     # TAK .p12 files use old encryption: OpenSSL 3 needs its legacy module (libopenssl-legacy)
-    if grep -qiE 'legacy|unsupported|RC2' "$RUN/p12.log" && ! opkg list-installed 2>/dev/null | grep -q '^libopenssl-legacy '; then
-        need_pkg_quiet libopenssl-legacy && openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$RUN/p12.log" && return 0
+    if grep -qiE 'legacy|unsupported|RC2' "$LOGS/p12.log" && ! opkg list-installed 2>/dev/null | grep -q '^libopenssl-legacy '; then
+        need_pkg_quiet libopenssl-legacy && openssl pkcs12 -legacy -in "$1" "${extra[@]}" -passin "pass:$3" -out "$2" 2>> "$LOGS/p12.log" && return 0
     fi
     return 1
 }
-p12_bad_password() { grep -qi 'mac verify\|invalid password' "$RUN/p12.log"; }
+p12_bad_password() { grep -qi 'mac verify\|invalid password' "$LOGS/p12.log"; }
 setup_certs() {
     mkdir -p "$CERT_DIR"; chmod 700 "$CERT_DIR"
     local client="$CERT_DIR/$CLIENT_PEM" ca="$CERT_DIR/$CA_PEM" p12s=() pw sel
@@ -1497,7 +1652,7 @@ tak_enroll() {
     local rc
     enroll_config() {
         code=$(curl -sS "${tls[@]}" --connect-timeout 15 --max-time 30 -K "$dir/auth" -o "$dir/config.xml" -w '%{http_code}' \
-            "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/config" 2>> "$RUN/enroll.log"); rc=$?
+            "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/config" 2>> "$LOGS/enroll.log"); rc=$?
     }
     CREATE_SPINNER "Enrolling"
     enroll_config
@@ -1518,12 +1673,12 @@ tak_enroll() {
     done < <(grep -o '<[A-Za-z0-9:]*nameEntry [^>]*>' "$dir/config.xml" | while read -r e; do
                  printf '%s|%s\n' "$(sed -n 's/.* name="\([^"]*\)".*/\1/p' <<< "$e")" "$(sed -n 's/.* value="\([^"]*\)".*/\1/p' <<< "$e")"
              done)
-    openssl req -new -newkey rsa:2048 -nodes -keyout "$dir/key.pem" -subj "$subj" -out "$dir/csr.pem" >> "$RUN/enroll.log" 2>&1 \
+    openssl req -new -newkey rsa:2048 -nodes -keyout "$dir/key.pem" -subj "$subj" -out "$dir/csr.pem" >> "$LOGS/enroll.log" 2>&1 \
         || { STOP_SPINNER; rm -rf "$dir"; info "Key generation failed"; return 1; }
     grep -v -- "-----" "$dir/csr.pem" > "$dir/csr.b64"
     code=$(curl -sS "${tls[@]}" --connect-timeout 15 --max-time 60 -K "$dir/auth" -o "$dir/signed.json" -w '%{http_code}' \
         -H "Content-Type: application/pkcs10" -H "Accept: application/json" --data-binary "@$dir/csr.b64" \
-        "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/signClient/v2?clientUid=$C_UID&version=$PRODUCT_NAME-$PAYLOAD_VERSION" 2>> "$RUN/enroll.log")
+        "https://$C_HOST:$C_ENROLL_PORT/Marti/api/tls/signClient/v2?clientUid=$C_UID&version=$PRODUCT_NAME-$PAYLOAD_VERSION" 2>> "$LOGS/enroll.log")
     rm -f "$dir/auth"
     STOP_SPINNER
     [ "$code" = 200 ] || { rm -rf "$dir"; info "Signing failed\nHTTP ${code:-none}"; return 1; }
@@ -1552,7 +1707,7 @@ stage_files() {
     if [ -d /root/loot/sharktak ] && [ ! -e "$LOOT_BASE" ]; then
         mkdir -p "${LOOT_BASE%/*}" && mv /root/loot/sharktak "$LOOT_BASE"
     fi
-    mkdir -p "$RUN" "$BASE_DIR" "$CERT_DIR" "$QUEUE_DIR" "$BASELINE_DIR" "$LOOT_BASE"
+    mkdir -p "$RUN" "$BASE_DIR" "$CERT_DIR" "$QUEUE_DIR" "$BASELINE_DIR" "$LOOT_BASE" "$LOGS"
     chmod 700 "$BASE_DIR" "$CERT_DIR"
     touch "$SITES_FILE"
     [ -f "$CERT_DIR/README.txt" ] || cat > "$CERT_DIR/README.txt" <<'EOF'
@@ -1597,7 +1752,7 @@ import_package() {  # import_package [zip]
     command -v unzip >/dev/null 2>&1 || need_pkg unzip unzip "Connection packages" || return 1
     rm -rf "${d:?}"; mkdir -p "$d"; chmod 700 "$d"
     CREATE_SPINNER "Importing package"
-    unzip -o -q "$zip" -d "$d" > "$RUN/import.log" 2>&1
+    unzip -o -q "$zip" -d "$d" > "$LOGS/import.log" 2>&1
     pref=$(find "$d" -type f -iname '*.pref' | head -1)
     STOP_SPINNER
     if [ -z "$pref" ]; then
@@ -1651,7 +1806,7 @@ import_package() {  # import_package [zip]
         [ "$r" = Enroll ] && tak_enroll && return 0
         return 1
     fi
-    info "Client cert not\nconverted.\nWrong password?\nSee $RUN/p12.log"
+    info "Client cert not\nconverted.\nWrong password?\nSee $LOGS/p12.log"
     return 1
 }
 import_from_menu() { import_package && note "Ready - Test Link"; }
@@ -1695,17 +1850,17 @@ install_packages() {
     local pkgs="openssl-util libopenssl-legacy unzip tcpdump snmp-utils" p n=0 i=0 failed=""   # zip: built in (mkzip_sh)
     ensure_net || return 1
     CREATE_SPINNER "opkg update"
-    opkg update > "$RUN/opkg.log" 2>&1     # the firmware's hak5 feed always errors - ignored
+    opkg update > "$LOGS/opkg.log" 2>&1     # the firmware's hak5 feed always errors - ignored
     STOP_SPINNER
     for p in $pkgs; do n=$((n + 1)); done
     CREATE_PROGRESS_BAR "Installing"
     for p in $pkgs; do
         i=$((i + 1))
-        opkg install "$p" >> "$RUN/opkg.log" 2>&1 || failed+=" $p"
+        opkg install "$p" >> "$LOGS/opkg.log" 2>&1 || failed+=" $p"
         SET_PROGRESS $(( i * 100 / n < 100 ? i * 100 / n : 99 ))
     done
     SET_PROGRESS 100
-    if [ -z "$failed" ]; then note "Packages installed"; else info "Not installed:\n${failed# }\nSee $RUN/opkg.log"; fi
+    if [ -z "$failed" ]; then note "Packages installed"; else info "Not installed:\n${failed# }\nSee $LOGS/opkg.log"; fi
     if ! nmap_nse; then
         local r; r=$(CONFIRMATION_DIALOG "Also install nmap-full? Adds nmap scripts (DHCP, http-title, ssl-cert, SMB). Replaces basic nmap." "Install")
         [ "$r" = Install ] && install_nmap_full
@@ -1713,11 +1868,11 @@ install_packages() {
 }
 install_nmap_full() {  # swap nmap -> nmap-full; put basic nmap back if that fails
     CREATE_SPINNER "Installing nmap-full"
-    { opkg remove nmap && opkg install nmap-full; } >> "$RUN/opkg.log" 2>&1
+    { opkg remove nmap && opkg install nmap-full; } >> "$LOGS/opkg.log" 2>&1
     local rc=$?
     if [ $rc -ne 0 ] || ! command -v nmap >/dev/null 2>&1; then
-        opkg install nmap >> "$RUN/opkg.log" 2>&1
-        STOP_SPINNER; info "nmap-full failed,\nbasic nmap kept.\nSee $RUN/opkg.log"; NSE_OK=""; return 1
+        opkg install nmap >> "$LOGS/opkg.log" 2>&1
+        STOP_SPINNER; info "nmap-full failed,\nbasic nmap kept.\nSee $LOGS/opkg.log"; NSE_OK=""; return 1
     fi
     STOP_SPINNER; NSE_OK=""
     if nmap_nse; then note "nmap-full installed"; else info "nmap installed but\nno script engine"; fi
@@ -1802,6 +1957,8 @@ refresh_contacts() {
 }
 
 cleanup() {   # runs on every exit (Quit or otherwise)
+    vitals_stop
+    step exit
     # put the LED back the way it was before the payload started (off if unknown)
     # shellcheck disable=SC2086
     if [ -n "$SAVED_LED" ]; then LED $SAVED_LED >/dev/null 2>&1 || LED OFF >/dev/null 2>&1; else LED OFF >/dev/null 2>&1; fi
@@ -1818,12 +1975,20 @@ LED SETUP
 mkdir -p "$RUN"
 START_SSH >/dev/null 2>&1       # so you can SSH in while the payload runs
 stage_files
+trim_logs
+step_check
+step "menu"
 trap cleanup EXIT
 load_config
 C_UID=$(device_uid)
 SCREEN_WRITE "SharkTAKDisplay $PAYLOAD_VERSION"
 [ "${MIGRATED:-0}" = 1 ] && SCREEN_WRITE "Moved SharkTAK data"
 [ "${CFG_REPAIRED:-0}" = 1 ] && SCREEN_WRITE "default.cfg cleaned up"
+if [ -n "$LAST_STOP" ]; then
+    SCREEN_WRITE "Last run stopped during:"
+    SCREEN_WRITE "${LAST_STOP:0:40}"
+    SCREEN_WRITE "Power? Results so far are in loot"
+fi
 [ "$(queue_count)" -gt 0 ] && SCREEN_WRITE "Queued: $(queue_count)"
 if [ ! -s "$CERT_DIR/$CLIENT_PEM" ] || [ "$C_HOST" = "takserver.example.com" ]; then
     SCREEN_WRITE "New here? Settings >"

@@ -2,6 +2,15 @@
 
 SharkTAKDisplay versions (the payload in `payloads/library/recon/SharkTAKDisplay`). Newest first.
 
+## 1.0.1
+- **Data packages build again**:
+  - The package failed and the payload could stop whenever the hour, minute or second was 08 or 09, because Bash read those as octal numbers. The device's number pickers are guarded the same way.
+  - About half the files in each package got a bad checksum: BusyBox `awk` caps numbers at 2147483647, so that math now runs in Bash.
+  - The zip writer no longer needs `od` (it falls back to `hexdump` or plain Bash), and a failed build is explained in `logs/zipcheck.log`.
+- **Big scans no longer lock up the jack**: nmap runs at the lowest CPU priority as a connect scan (`-sT`, `SCAN_TYPE`) with `-T3`, a 50 packets/s cap (`SCAN_RATE`) and capped parallelism. `logs/vitals.log` records memory and load every 3 s while scanning. The service scan runs in batches of 4 hosts (`SCAN_BATCH`), each saved as it finishes. A stuck batch is stopped after 240 s (`BATCH_LIMIT`), and version detection (`-sV`, about 20 MB) only runs with 30 MB free (`MIN_FREE_KB`), so on the Shark Jack Display it's a plain port scan. A memory watchdog stops nmap if free memory drops below 3 MB (`WATCHDOG_KB`) instead of letting the jack freeze; the results so far are kept. On battery with more than 24 live hosts (`BIG_SCAN_HOSTS`), SharkTAKDisplay asks whether to continue or run a lighter scan (top 20 ports, no version detection).
+- What the TAK Server sends during a session is capped at 512 KB in memory and freed right after contacts are read, and each session's size is logged.
+- **Logs survive a shutdown**: logs moved to `/root/sharktakdisplay/logs/` on flash, with `history.log` and the last step that was running. After an unclean stop, the next start shows where it stopped.
+
 ## 1.0.0
 - First release, as SharkTAKDisplay, with TAKtical Sharky as the logo.
 - **Easy setup**: the first run stages `/root/sharktakdisplay/certs/` with a README and writes a `default.cfg` with every main setting. An ATAK **connection package** (`.zip`) dropped in `certs/` imports the server, port and both certificates. *Settings > Setup Check* shows packages and TAK status, fixes what's missing and tests the link. *Settings > Install Packages* installs everything in one press. Settings live in one file, the payload's `default.cfg`.

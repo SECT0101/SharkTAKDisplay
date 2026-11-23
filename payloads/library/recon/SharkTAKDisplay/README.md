@@ -111,6 +111,13 @@ SSH works while the payload runs, because the payload starts the SSH server, and
 | `STALE_HOURS` | `24` | survey marker lifetime |
 | `LISTEN` | `8` | seconds to listen for contacts |
 | `CHAT_ALERT` | `1` | GeoChat when a baseline change or rogue DHCP is found |
+| `SCAN_BATCH` | `4` | hosts per service-scan batch; each batch is saved as soon as it finishes |
+| `BATCH_LIMIT` | `240` | seconds before a stuck batch is stopped and the scan moves on |
+| `MIN_FREE_KB` | `30000` | version detection (`-sV`) needs about 20 MB, so it only runs with this much free memory |
+| `WATCHDOG_KB` | `3000` | stop nmap if free memory falls below this, so the jack doesn't freeze |
+| `SCAN_RATE` | `50` | nmap `--max-rate` in packets per second; the jack's Ethernet can lock up under floods |
+| `SCAN_TYPE` | `connect` | `connect` (`-sT`, gentle) or `syn` (`-sS`, raw packets, faster) |
+| `BIG_SCAN_HOSTS` | `24` | on battery, ask before a service scan of more live hosts than this |
 
 ## Menu
 
@@ -137,11 +144,18 @@ Quit
 | `/root/sharktakdisplay/sites.txt` | saved sites: `name\|lat\|lon` |
 | `/root/sharktakdisplay/contacts.txt` | TAK contacts last seen |
 | `/root/loot/sharktakdisplay/<date-time>/` | every survey: summary, hosts, nmap, DHCP, LLDP, diff, pcap, data package |
-| `/tmp/sharktakdisplay/*.log` | logs (`ssl.log`, `upload.log`, `opkg.log`, `p12.log`, `import.log`); kept until reboot |
+| `/root/sharktakdisplay/logs/` | logs (`ssl.log`, `upload.log`, `opkg.log`, `p12.log`, `import.log`, `zipcheck.log`), plus `history.log` and `step`, the last step that was running. Kept on flash so they survive a shutdown or a flat battery |
 
 ## Battery
 
-The battery lasts about 30 minutes. A Full Survey of a busy /24 with the default 100 ports takes a few minutes. Version detection, NSE and 1000 ports all add time. Run from a USB-C power bank for long jobs.
+The battery lasts about 30 minutes, and a long service scan keeps the CPU at full load. On a busy network that can flatten the battery or shut the jack off. To reduce the damage:
+
+- On battery with more than `BIG_SCAN_HOSTS` live hosts, SharkTAKDisplay asks before the service scan. *Lighter* scans the top 20 ports without version detection.
+- Hosts are scanned in batches of `SCAN_BATCH`, and each batch is saved as it finishes, so a shutdown keeps what was already done.
+- nmap runs at the lowest CPU priority (`nice`) as a connect scan (`-sT`), with `-T3`, a packet rate cap (`SCAN_RATE`) and capped parallelism, so the screen and SSH stay responsive. While scanning, `logs/vitals.log` records free memory, load and nmap's memory every 3 seconds, so a lockup leaves evidence. A watchdog checks memory every second and stops nmap if free memory falls below `WATCHDOG_KB`, before the jack can freeze; the results so far are kept. A batch that runs past `BATCH_LIMIT` is stopped, and the scan moves on. Version detection only runs with `MIN_FREE_KB` free, so on the Shark Jack Display the service scan is normally ports only.
+- The last step is written to `/root/sharktakdisplay/logs/step`. After an unclean stop, the next start shows where it stopped.
+
+For big networks, version detection, NSE or 1000 ports, run from a USB-C power bank.
 
 ## Notes
 
