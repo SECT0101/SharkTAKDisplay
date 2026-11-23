@@ -1,0 +1,15 @@
+# Never commit TAK certificates or keys
+*.p12
+*.pem
+*.key
+*.crt
+
+# Settings saved on the device
+payloads/**/default.cfg
+payloads/**/*.cfg
+sharktak.conf
+
+# Local test artifacts
+*.log
+*.pcap
+.DS_Store

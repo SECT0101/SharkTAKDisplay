@@ -1,0 +1,23 @@
+name: release
+
+# Push a tag like v1.0.1 to publish a release with a ready-to-copy zip of the payload.
+on:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Zip payload
+        run: |
+          set -e
+          mkdir dist
+          (cd payloads/library/recon && zip -qr "$GITHUB_WORKSPACE/dist/SharkTAKDisplay-${GITHUB_REF_NAME}.zip" SharkTAKDisplay -x '*/default.cfg' '*/*.bak')
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
